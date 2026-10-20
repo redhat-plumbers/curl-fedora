@@ -12,6 +12,8 @@ name: 'Source'
       - master
       - 'curl-*'
       - '*/ci'
+      - 'rawhide'
+      - 'f*'
     paths-ignore:
       - 'appveyor.*'
       - 'Dockerfile'
@@ -19,6 +21,8 @@ name: 'Source'
     branches:
       - master
       - 'curl-*'
+      - 'rawhide'
+      - 'f*'
     paths-ignore:
       - 'appveyor.*'
       - 'Dockerfile'

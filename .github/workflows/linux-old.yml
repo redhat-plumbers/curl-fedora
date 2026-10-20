@@ -24,6 +24,8 @@ name: 'Linux Old'
       - master
       - 'curl-*'
       - '*/ci'
+      - 'rawhide'
+      - 'f*'
     paths-ignore:
       - '**/*.md'
       - 'appveyor.*'
@@ -33,6 +35,8 @@ name: 'Linux Old'
     branches:
       - master
       - 'curl-*'
+      - 'rawhide'
+      - 'f*'
     paths-ignore:
       - '**/*.md'
       - 'appveyor.*'

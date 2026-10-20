@@ -10,6 +10,8 @@ name: 'Linux HTTP/3'
       - master
       - 'curl-*'
       - '*/ci'
+      - 'rawhide'
+      - 'f*'
     paths-ignore:
       - '**/*.md'
       - 'appveyor.*'
@@ -19,6 +21,8 @@ name: 'Linux HTTP/3'
     branches:
       - master
       - 'curl-*'
+      - 'rawhide'
+      - 'f*'
     paths-ignore:
       - '**/*.md'
       - 'appveyor.*'
