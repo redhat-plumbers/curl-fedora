@@ -423,6 +423,8 @@ static int myssh_is_known(struct Curl_easy *data, struct ssh_conn *sshc)
       keymatch = CURLKHMATCH_OK;
       break;
     case SSH_KNOWN_HOSTS_OTHER:
+      keymatch = CURLKHMATCH_MISMATCH;
+      break;
     case SSH_KNOWN_HOSTS_NOT_FOUND:
     case SSH_KNOWN_HOSTS_UNKNOWN:
     case SSH_KNOWN_HOSTS_ERROR:
@@ -970,7 +972,7 @@ static int myssh_in_AUTH_PKEY_INIT(struct Curl_easy *data,
   /* Two choices, (1) private key was given on CMD,
    * (2) use the "default" keys. */
   if(data->set.str[STRING_SSH_PRIVATE_KEY]) {
-    if(sshc->pubkey && !data->set.ssl.key_passwd) {
+    if(sshc->pubkey && !data->set.ssl.primary.key_passwd) {
       rc = ssh_userauth_try_publickey(sshc->ssh_session, NULL,
                                       sshc->pubkey);
       if(rc == SSH_AUTH_AGAIN)
@@ -984,7 +986,7 @@ static int myssh_in_AUTH_PKEY_INIT(struct Curl_easy *data,
 
     rc = ssh_pki_import_privkey_file(data->
                                      set.str[STRING_SSH_PRIVATE_KEY],
-                                     data->set.ssl.key_passwd, NULL,
+                                     data->set.ssl.primary.key_passwd, NULL,
                                      NULL, &sshc->privkey);
     if(rc != SSH_OK) {
       failf(data, "Could not load private key file %s",
@@ -997,7 +999,7 @@ static int myssh_in_AUTH_PKEY_INIT(struct Curl_easy *data,
   }
   else {
     rc = ssh_userauth_publickey_auto(sshc->ssh_session, NULL,
-                                         data->set.ssl.key_passwd);
+                                         data->set.ssl.primary.key_passwd);
     if(rc == SSH_AUTH_AGAIN)
       return SSH_AGAIN;
 

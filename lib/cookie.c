@@ -296,9 +296,9 @@ static char *sanitize_cookie_path(const char *cookie_path)
     /* Let cookie-path be the default-path. */
     return strdup("/");
 
-  /* remove trailing slash */
+  /* remove trailing slash when path is non-empty */
   /* convert /hoge/ to /hoge */
-  if(len && cookie_path[len - 1] == '/')
+  if(len > 1 && cookie_path[len - 1] == '/')
     len--;
 
   return Curl_memdup0(cookie_path, len);
@@ -437,9 +437,9 @@ static bool bad_domain(const char *domain, size_t len)
 static bool invalid_octets(const char *ptr)
 {
   const unsigned char *p = (const unsigned char *)ptr;
-  /* Reject all bytes \x01 - \x1f (*except* \x09, TAB) + \x7f */
+  /* Reject all bytes \x01 - \x1f + \x7f */
   while(*p) {
-    if(((*p != 9) && (*p < 0x20)) || (*p == 0x7f))
+    if((*p < 0x20) || (*p == 0x7f))
       return TRUE;
     p++;
   }
@@ -497,7 +497,7 @@ parse_cookie_header(struct Curl_easy *data,
     struct Curl_str val;
 
     /* we have a <name>=<value> pair or a stand-alone word here */
-    if(!curlx_str_cspn(&ptr, &name, ";\t\r\n=")) {
+    if(!curlx_str_cspn(&ptr, &name, ";\r\n=")) {
       bool done = FALSE;
       bool sep = FALSE;
       curlx_str_trimblanks(&name);
@@ -907,12 +907,21 @@ is_public_suffix(struct Curl_easy *data,
     char lcookie[256];
     size_t dlen = strlen(domain);
     size_t clen = strlen(co->domain);
+
+    /* trim trailing dots */
+    if(dlen && (domain[dlen - 1] == '.'))
+      dlen--;
+    if(clen && (co->domain[clen - 1] == '.'))
+      clen--;
+
     if((dlen < sizeof(lcase)) && (clen < sizeof(lcookie))) {
       const psl_ctx_t *psl = Curl_psl_use(data);
       if(psl) {
         /* the PSL check requires lowercase domain name and pattern */
-        Curl_strntolower(lcase, domain, dlen + 1);
-        Curl_strntolower(lcookie, co->domain, clen + 1);
+        Curl_strntolower(lcase, domain, dlen);
+        lcase[dlen] = 0;
+        Curl_strntolower(lcookie, co->domain, clen);
+        lcookie[clen] = 0;
         acceptable = psl_is_cookie_domain_acceptable(psl, lcase, lcookie);
         Curl_psl_release(data);
       }
@@ -965,7 +974,7 @@ replace_existing(struct Curl_easy *data,
          clist->spath && co->spath && /* both have paths */
          clist->secure && !co->secure && !secure) {
         size_t cllen;
-        const char *sep;
+        const char *sep = NULL;
 
         /*
          * A non-secure cookie may not overlay an existing secure cookie.
@@ -974,8 +983,9 @@ replace_existing(struct Curl_easy *data,
          * "/loginhelper" is ok.
          */
 
-        sep = strchr(clist->spath + 1, '/');
-
+        DEBUGASSERT(clist->spath[0]);
+        if(clist->spath[0])
+          sep = strchr(clist->spath + 1, '/');
         if(sep)
           cllen = sep - clist->spath;
         else

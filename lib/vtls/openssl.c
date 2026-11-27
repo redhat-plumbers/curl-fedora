@@ -4000,7 +4000,7 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   struct ssl_config_data *ssl_config = Curl_ssl_cf_get_config(cf, data);
   char * const ssl_cert = ssl_config->primary.clientcert;
   const struct curl_blob *ssl_cert_blob = ssl_config->primary.cert_blob;
-  const char * const ssl_cert_type = ssl_config->cert_type;
+  const char * const ssl_cert_type = ssl_config->primary.cert_type;
   const bool verifypeer = conn_config->verifypeer;
   unsigned int ssl_version_min;
   char error_buffer[256];
@@ -4030,6 +4030,11 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
           ossl_strerror(ERR_peek_error(), error_buffer, sizeof(error_buffer)));
     return CURLE_OUT_OF_MEMORY;
   }
+#ifdef OPENSSL_HAS_PROVIDERS
+  if(data->state.libctx)
+    /* forbid connection reuse with provider/engine use */
+    connclose(data->conn, "provider in use");
+#endif
 
   if(cb_setup) {
     result = cb_setup(cf, data, cb_user_data);
@@ -4186,8 +4191,9 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
     if(!result &&
        !cert_stuff(data, octx->ssl_ctx,
                    ssl_cert, ssl_cert_blob, ssl_cert_type,
-                   ssl_config->key, ssl_config->key_blob,
-                   ssl_config->key_type, ssl_config->key_passwd))
+                   ssl_config->primary.key, ssl_config->primary.key_blob,
+                   ssl_config->primary.key_type,
+                   ssl_config->primary.key_passwd))
       result = CURLE_SSL_CERTPROBLEM;
     if(result)
       /* failf() is already done in cert_stuff() */
@@ -4841,6 +4847,18 @@ static void infof_certstack(struct Curl_easy *data, const SSL *ssl)
 #define infof_certstack(data, ssl)
 #endif
 
+static const char *pinned(struct Curl_cfilter *cf,
+                          struct Curl_easy *data)
+{
+  (void)cf;
+  return
+#ifndef CURL_DISABLE_PROXY
+    Curl_ssl_cf_is_proxy(cf) ?
+    data->set.str[STRING_SSL_PINNEDPUBLICKEY_PROXY] :
+#endif
+    data->set.str[STRING_SSL_PINNEDPUBLICKEY];
+}
+
 #define MAX_CERT_NAME_LENGTH 2048
 
 CURLcode Curl_oss_check_peer_cert(struct Curl_cfilter *cf,
@@ -4881,7 +4899,7 @@ CURLcode Curl_oss_check_peer_cert(struct Curl_cfilter *cf,
   octx->server_cert = SSL_get1_peer_certificate(octx->ssl);
   if(!octx->server_cert) {
     BIO_free(mem);
-    if(!strict)
+    if(!strict && !pinned(cf, data))
       return CURLE_OK;
 
     failf(data, "SSL: could not get peer certificate");

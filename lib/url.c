@@ -84,6 +84,7 @@
 #include "http_digest.h"
 #include "http_negotiate.h"
 #include "select.h"
+#include "vauth/vauth.h"
 #include "multiif.h"
 #include "easyif.h"
 #include "speedcheck.h"
@@ -128,12 +129,6 @@
 #include "curl_printf.h"
 #include "curl_memory.h"
 #include "memdebug.h"
-
-#ifdef USE_NGHTTP2
-static void data_priority_cleanup(struct Curl_easy *data);
-#else
-#define data_priority_cleanup(x)
-#endif
 
 /* Some parts of the code (e.g. chunked encoding) assume this buffer has at
  * more than just a few bytes to play with. Do not let it become too small or
@@ -301,8 +296,6 @@ CURLcode Curl_close(struct Curl_easy **datap)
   Curl_resolv_unlink(data, &data->state.dns[0]); /* done with this */
   Curl_resolv_unlink(data, &data->state.dns[1]);
 
-  data_priority_cleanup(data);
-
   /* No longer a dirty share, if it exists */
   if(data->share) {
     Curl_share_lock(data, CURL_LOCK_DATA_SHARE, CURL_LOCK_ACCESS_SINGLE);
@@ -344,6 +337,9 @@ CURLcode Curl_close(struct Curl_easy **datap)
   Curl_freeset(data);
   Curl_headers_cleanup(data);
   Curl_netrc_cleanup(&data->state.netrc);
+#ifndef CURL_DISABLE_DIGEST_AUTH
+  free(data->state.envproxy);
+#endif
   free(data);
   return CURLE_OK;
 }
@@ -593,6 +589,8 @@ void Curl_conn_free(struct Curl_easy *data, struct connectdata *conn)
   Curl_safefree(conn->sasl_authzid);
   Curl_safefree(conn->options);
   Curl_safefree(conn->oauth_bearer);
+  Curl_safefree(conn->sasl_service);
+  Curl_safefree(conn->proxy_sasl_service);
   Curl_safefree(conn->host.rawalloc); /* hostname buffer */
   Curl_safefree(conn->conn_to_host.rawalloc); /* hostname buffer */
   Curl_safefree(conn->hostname_resolve);
@@ -643,34 +641,15 @@ proxy_info_matches(const struct proxy_info *data,
 {
   if((data->proxytype == needle->proxytype) &&
      (data->port == needle->port) &&
-     curl_strequal(data->host.name, needle->host.name))
-    return TRUE;
+     curl_strequal(data->host.name, needle->host.name)) {
 
+    if(Curl_timestrcmp(data->user, needle->user) ||
+       Curl_timestrcmp(data->passwd, needle->passwd))
+      return FALSE;
+    return TRUE;
+  }
   return FALSE;
 }
-
-static bool
-socks_proxy_info_matches(const struct proxy_info *data,
-                         const struct proxy_info *needle)
-{
-  if(!proxy_info_matches(data, needle))
-    return FALSE;
-
-  /* the user information is case-sensitive
-     or at least it is not defined as case-insensitive
-     see https://datatracker.ietf.org/doc/html/rfc3986#section-3.2.1 */
-
-  /* curl_strequal does a case insensitive comparison,
-     so do not use it here! */
-  if(Curl_timestrcmp(data->user, needle->user) ||
-     Curl_timestrcmp(data->passwd, needle->passwd))
-    return FALSE;
-  return TRUE;
-}
-#else
-/* disabled, will not get called */
-#define proxy_info_matches(x,y) FALSE
-#define socks_proxy_info_matches(x,y) FALSE
 #endif
 
 /* A connection has to have been idle for less than 'conn_max_idle_ms'
@@ -820,7 +799,13 @@ struct url_conn_match {
   BIT(may_multiplex);
   BIT(want_ntlm_http);
   BIT(want_proxy_ntlm_http);
-
+  BIT(want_nego_http);
+  BIT(want_proxy_nego_http);
+  BIT(may_tls); /* May upgrade clear-text connection to TLS, can only reuse
+                 * connections that have matching TLS configuration.
+                 * Always TRUE if `require_tls` is TRUE. */
+  BIT(require_tls); /* Requires TLS use from a clear-text start, can only
+                 * reuse connections that have TLS. */
   BIT(wait_pipe);
   BIT(force_reuse);
   BIT(seen_pending_conn);
@@ -971,6 +956,9 @@ static bool url_match_ssl_use(struct connectdata *conn,
     if(get_protocol_family(conn->handler) != m->needle->handler->protocol)
       return FALSE;
   }
+  else if(m->require_tls)
+    /* a clear-text STARTTLS protocol with required TLS */
+    return FALSE;
   return TRUE;
 }
 
@@ -983,8 +971,7 @@ static bool url_match_proxy_use(struct connectdata *conn,
     return FALSE;
 
   if(m->needle->bits.socksproxy &&
-    !socks_proxy_info_matches(&m->needle->socks_proxy,
-                              &conn->socks_proxy))
+     !proxy_info_matches(&m->needle->socks_proxy, &conn->socks_proxy))
     return FALSE;
 
   if(m->needle->bits.httpproxy) {
@@ -1162,8 +1149,8 @@ static bool url_match_destination(struct connectdata *conn,
 static bool url_match_ssl_config(struct connectdata *conn,
                                  struct url_conn_match *m)
 {
-  /* If talking TLS, conn needs to use the same SSL options. */
-  if((m->needle->handler->flags & PROTOPT_SSL) &&
+  /* If talking/upgrading to TLS, conn needs to use the same SSL options. */
+  if(((m->needle->handler->flags & PROTOPT_SSL) || m->may_tls) &&
      !Curl_ssl_conn_config_match(m->data, conn, FALSE)) {
     DEBUGF(infof(m->data,
                  "Connection #%" FMT_OFF_T
@@ -1185,7 +1172,8 @@ static bool url_match_auth_ntlm(struct connectdata *conn,
      partway through a handshake!) */
   if(m->want_ntlm_http) {
     if(Curl_timestrcmp(m->needle->user, conn->user) ||
-       Curl_timestrcmp(m->needle->passwd, conn->passwd)) {
+       Curl_timestrcmp(m->needle->passwd, conn->passwd) ||
+       Curl_timestrcmp(m->needle->sasl_service, conn->sasl_service)) {
 
       /* we prefer a credential match, but this is at least a connection
          that can be reused and "upgraded" to NTLM */
@@ -1210,7 +1198,9 @@ static bool url_match_auth_ntlm(struct connectdata *conn,
     if(Curl_timestrcmp(m->needle->http_proxy.user,
                        conn->http_proxy.user) ||
        Curl_timestrcmp(m->needle->http_proxy.passwd,
-                       conn->http_proxy.passwd))
+                       conn->http_proxy.passwd) ||
+       Curl_timestrcmp(m->needle->proxy_sasl_service,
+                       conn->proxy_sasl_service))
       return FALSE;
   }
   else if(conn->proxy_ntlm_state != NTLMSTATE_NONE) {
@@ -1240,6 +1230,66 @@ static bool url_match_auth_ntlm(struct connectdata *conn,
 }
 #else
 #define url_match_auth_ntlm(c,m)    ((void)c, (void)m, TRUE)
+#endif
+
+#ifdef USE_SPNEGO
+static bool url_match_auth_nego(struct connectdata *conn,
+                                struct url_conn_match *m)
+{
+  /* If we are looking for an HTTP+Negotiate connection, check if this is
+     already authenticating with the right credentials. If not, keep looking
+     so that we can reuse Negotiate connections if possible. */
+  if(m->want_nego_http) {
+    if(Curl_timestrcmp(m->needle->user, conn->user) ||
+       Curl_timestrcmp(m->needle->passwd, conn->passwd) ||
+       Curl_timestrcmp(m->needle->sasl_service, conn->sasl_service))
+      return FALSE;
+  }
+  else if(conn->http_negotiate_state != GSS_AUTHNONE) {
+    /* Connection is using Negotiate auth but we do not want Negotiate */
+    return FALSE;
+  }
+
+#ifndef CURL_DISABLE_PROXY
+  /* Same for Proxy Negotiate authentication */
+  if(m->want_proxy_nego_http) {
+    /* Both conn->http_proxy.user and conn->http_proxy.passwd can be
+     * NULL */
+    if(!conn->http_proxy.user || !conn->http_proxy.passwd)
+      return FALSE;
+
+    if(Curl_timestrcmp(m->needle->http_proxy.user,
+                       conn->http_proxy.user) ||
+       Curl_timestrcmp(m->needle->http_proxy.passwd,
+                       conn->http_proxy.passwd) ||
+       Curl_timestrcmp(m->needle->proxy_sasl_service,
+                       conn->proxy_sasl_service))
+      return FALSE;
+  }
+  else if(conn->proxy_negotiate_state != GSS_AUTHNONE) {
+    /* Proxy connection is using Negotiate auth but we do not want Negotiate */
+    return FALSE;
+  }
+#endif
+  if(m->want_nego_http || m->want_proxy_nego_http) {
+    /* Credentials are already checked, we may use this connection. We MUST
+     * use a connection where it has already been fully negotiated. If it has
+     * not, we keep on looking for a better one. */
+    m->found = conn;
+    if((m->want_nego_http &&
+        (conn->http_negotiate_state != GSS_AUTHNONE)) ||
+       (m->want_proxy_nego_http &&
+        (conn->proxy_negotiate_state != GSS_AUTHNONE))) {
+      /* We must use this connection, no other */
+      m->force_reuse = TRUE;
+      return TRUE;
+    }
+    return FALSE; /* get another */
+  }
+  return TRUE;
+}
+#else
+#define url_match_auth_nego(c, m) ((void)c, (void)m, TRUE)
 #endif
 
 static bool url_match_conn(struct connectdata *conn, void *userdata)
@@ -1280,6 +1330,11 @@ static bool url_match_conn(struct connectdata *conn, void *userdata)
     return FALSE;
 
   if(!url_match_auth_ntlm(conn, m))
+    return FALSE;
+  else if(m->force_reuse)
+    return TRUE;
+
+  if(!url_match_auth_nego(conn, m))
     return FALSE;
   else if(m->force_reuse)
     return TRUE;
@@ -1350,15 +1405,30 @@ ConnectionExists(struct Curl_easy *data,
   match.may_multiplex = xfer_may_multiplex(data, needle);
 
 #ifdef USE_NTLM
-  match.want_ntlm_http = ((data->state.authhost.want & CURLAUTH_NTLM) &&
-                          (needle->handler->protocol & PROTO_FAMILY_HTTP));
+  match.want_ntlm_http =
+    (data->state.authhost.want & CURLAUTH_NTLM) &&
+    (needle->handler->protocol & PROTO_FAMILY_HTTP);
 #ifndef CURL_DISABLE_PROXY
   match.want_proxy_ntlm_http =
-    (needle->bits.proxy_user_passwd &&
-     (data->state.authproxy.want & CURLAUTH_NTLM) &&
-     (needle->handler->protocol & PROTO_FAMILY_HTTP));
+    needle->bits.proxy_user_passwd &&
+    (data->state.authproxy.want & CURLAUTH_NTLM) &&
+    (needle->handler->protocol & PROTO_FAMILY_HTTP);
 #endif
 #endif
+
+#if !defined(CURL_DISABLE_HTTP) && defined(USE_SPNEGO)
+  match.want_nego_http =
+    (data->state.authhost.want & CURLAUTH_NEGOTIATE) &&
+    (needle->handler->protocol & PROTO_FAMILY_HTTP);
+#ifndef CURL_DISABLE_PROXY
+  match.want_proxy_nego_http =
+    needle->bits.proxy_user_passwd &&
+    (data->state.authproxy.want & CURLAUTH_NEGOTIATE) &&
+    (needle->handler->protocol & PROTO_FAMILY_HTTP);
+#endif
+#endif
+  match.require_tls = data->set.use_ssl >= CURLUSESSL_CONTROL;
+  match.may_tls = data->set.use_ssl > CURLUSESSL_NONE;
 
   /* Find a connection in the pool that matches what "data + needle"
    * requires. If a suitable candidate is found, it is attached to "data". */
@@ -2581,6 +2651,14 @@ static CURLcode create_conn_helper_init_proxy(struct Curl_easy *data,
       result = CURLE_UNSUPPORTED_PROTOCOL;
       goto out;
 #else
+#ifndef CURL_DISABLE_DIGEST_AUTH
+      if(!Curl_safecmp(data->state.envproxy, proxy)) {
+        /* proxy changed */
+        Curl_auth_digest_cleanup(&data->state.proxydigest);
+        free(data->state.envproxy);
+        data->state.envproxy = strdup(proxy);
+      }
+#endif
       /* force this connection's protocol to become HTTP if compatible */
       if(!(conn->handler->protocol & PROTO_FAMILY_HTTP)) {
         if((conn->handler->flags & PROTOPT_PROXY_AS_HTTP) &&
@@ -3526,6 +3604,25 @@ static CURLcode create_conn(struct Curl_easy *data,
     }
   }
 
+  if(data->set.str[STRING_SERVICE_NAME]) {
+    conn->sasl_service = strdup(data->set.str[STRING_SERVICE_NAME]);
+    if(!conn->sasl_service) {
+      result = CURLE_OUT_OF_MEMORY;
+      goto out;
+    }
+  }
+
+#ifndef CURL_DISABLE_PROXY
+  if(data->set.str[STRING_PROXY_SERVICE_NAME]) {
+    conn->proxy_sasl_service =
+      strdup(data->set.str[STRING_PROXY_SERVICE_NAME]);
+    if(!conn->proxy_sasl_service) {
+      result = CURLE_OUT_OF_MEMORY;
+      goto out;
+    }
+  }
+#endif
+
 #ifdef USE_UNIX_SOCKETS
   if(data->set.str[STRING_UNIX_SOCKET_PATH]) {
     conn->unix_domain_socket = strdup(data->set.str[STRING_UNIX_SOCKET_PATH]);
@@ -3982,96 +4079,6 @@ CURLcode Curl_init_do(struct Curl_easy *data, struct connectdata *conn)
 }
 
 #if defined(USE_HTTP2) || defined(USE_HTTP3)
-
-#ifdef USE_NGHTTP2
-
-static void priority_remove_child(struct Curl_easy *parent,
-                                  struct Curl_easy *child)
-{
-  struct Curl_data_prio_node **pnext = &parent->set.priority.children;
-  struct Curl_data_prio_node *pnode = parent->set.priority.children;
-
-  DEBUGASSERT(child->set.priority.parent == parent);
-  while(pnode && pnode->data != child) {
-    pnext = &pnode->next;
-    pnode = pnode->next;
-  }
-
-  DEBUGASSERT(pnode);
-  if(pnode) {
-    *pnext = pnode->next;
-    free(pnode);
-  }
-
-  child->set.priority.parent = 0;
-  child->set.priority.exclusive = FALSE;
-}
-
-CURLcode Curl_data_priority_add_child(struct Curl_easy *parent,
-                                      struct Curl_easy *child,
-                                      bool exclusive)
-{
-  if(child->set.priority.parent) {
-    priority_remove_child(child->set.priority.parent, child);
-  }
-
-  if(parent) {
-    struct Curl_data_prio_node **tail;
-    struct Curl_data_prio_node *pnode;
-
-    pnode = calloc(1, sizeof(*pnode));
-    if(!pnode)
-      return CURLE_OUT_OF_MEMORY;
-    pnode->data = child;
-
-    if(parent->set.priority.children && exclusive) {
-      /* exclusive: move all existing children underneath the new child */
-      struct Curl_data_prio_node *node = parent->set.priority.children;
-      while(node) {
-        node->data->set.priority.parent = child;
-        node = node->next;
-      }
-
-      tail = &child->set.priority.children;
-      while(*tail)
-        tail = &(*tail)->next;
-
-      DEBUGASSERT(!*tail);
-      *tail = parent->set.priority.children;
-      parent->set.priority.children = 0;
-    }
-
-    tail = &parent->set.priority.children;
-    while(*tail) {
-      (*tail)->data->set.priority.exclusive = FALSE;
-      tail = &(*tail)->next;
-    }
-
-    DEBUGASSERT(!*tail);
-    *tail = pnode;
-  }
-
-  child->set.priority.parent = parent;
-  child->set.priority.exclusive = exclusive;
-  return CURLE_OK;
-}
-
-#endif /* USE_NGHTTP2 */
-
-#ifdef USE_NGHTTP2
-static void data_priority_cleanup(struct Curl_easy *data)
-{
-  while(data->set.priority.children) {
-    struct Curl_easy *tmp = data->set.priority.children->data;
-    priority_remove_child(data, tmp);
-    if(data->set.priority.parent)
-      Curl_data_priority_add_child(data->set.priority.parent, tmp, FALSE);
-  }
-
-  if(data->set.priority.parent)
-    priority_remove_child(data->set.priority.parent, data);
-}
-#endif
 
 void Curl_data_priority_clear_state(struct Curl_easy *data)
 {

@@ -54,6 +54,7 @@
 #include "tftp.h"
 #include "strdup.h"
 #include "escape.h"
+#include "vauth/vauth.h"
 
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
@@ -1646,13 +1647,10 @@ static CURLcode setopt_pointers(struct Curl_easy *data, CURLoption option,
 
 #ifdef USE_HTTP2
   case CURLOPT_STREAM_DEPENDS:
-  case CURLOPT_STREAM_DEPENDS_E: {
-    struct Curl_easy *dep = va_arg(param, struct Curl_easy *);
-    if(!dep || GOOD_EASY_HANDLE(dep))
-      return Curl_data_priority_add_child(dep, data,
-                                          option == CURLOPT_STREAM_DEPENDS_E);
+  case CURLOPT_STREAM_DEPENDS_E:
+    /* not doing stream dependencies any longer, but accept options
+     * for backward compatibility */
     break;
-  }
 #endif
 
   default:
@@ -1660,6 +1658,20 @@ static CURLcode setopt_pointers(struct Curl_easy *data, CURLoption option,
   }
   return result;
 }
+
+#ifndef CURL_DISABLE_PROXY
+static CURLcode setproxy(struct Curl_easy *data, const char *proxy)
+{
+  if((data->set.str[STRING_PROXY] && proxy) &&
+     /* there was one set, is this a new one? */
+     !strcmp(data->set.str[STRING_PROXY], proxy))
+    return CURLE_OK; /* same one as before */
+
+  Curl_auth_digest_cleanup(&data->state.proxydigest);
+  memset(&data->state.authproxy, 0, sizeof(data->state.authproxy));
+  return Curl_setstropt(&data->set.str[STRING_PROXY], proxy);
+}
+#endif
 
 static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
                             char *ptr)
@@ -1948,7 +1960,7 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
      * Setting it to NULL, means no proxy but allows the environment variables
      * to decide for us (if CURLOPT_SOCKS_PROXY setting it to NULL).
      */
-    return Curl_setstropt(&data->set.str[STRING_PROXY], ptr);
+    return setproxy(data, ptr);
 
   case CURLOPT_PRE_PROXY:
     /*
@@ -2150,16 +2162,16 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
     result = setstropt_userpwd(ptr, &u, &p);
 
     /* URL decode the components */
-    if(!result && u) {
+    if(!result) {
       Curl_safefree(data->set.str[STRING_PROXYUSERNAME]);
-      result = Curl_urldecode(u, 0, &data->set.str[STRING_PROXYUSERNAME], NULL,
-                              REJECT_ZERO);
-    }
-    if(!result && p) {
       Curl_safefree(data->set.str[STRING_PROXYPASSWORD]);
+      if(u)
+        result = Curl_urldecode(u, 0, &data->set.str[STRING_PROXYUSERNAME],
+                                NULL, REJECT_ZERO);
+    }
+    if(!result && p)
       result = Curl_urldecode(p, 0, &data->set.str[STRING_PROXYPASSWORD], NULL,
                               REJECT_ZERO);
-    }
     free(u);
     free(p);
   }

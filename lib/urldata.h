@@ -267,9 +267,14 @@ struct ssl_primary_config {
   char *signature_algorithms; /* list of signature algorithms to use */
   char *pinned_key;
   char *CRLfile;         /* CRL to check certificate revocation */
+  char *cert_type;       /* format for certificate (default: PEM) */
+  char *key;             /* private key filename */
+  char *key_type;        /* format for private key (default: PEM) */
+  char *key_passwd;      /* plain text private key password */
   struct curl_blob *cert_blob;
   struct curl_blob *ca_info_blob;
   struct curl_blob *issuercert_blob;
+  struct curl_blob *key_blob;
 #ifdef USE_TLS_SRP
   char *username; /* TLS username (for, e.g., SRP) */
   char *password; /* TLS password (for, e.g., SRP) */
@@ -289,11 +294,6 @@ struct ssl_config_data {
   long certverifyresult; /* result from the certificate verification */
   curl_ssl_ctx_callback fsslctx; /* function to initialize ssl ctx */
   void *fsslctxp;        /* parameter for call back */
-  char *cert_type; /* format for certificate (default: PEM)*/
-  char *key; /* private key filename */
-  struct curl_blob *key_blob;
-  char *key_type; /* format for private key (default: PEM) */
-  char *key_passwd; /* plain text private key password */
   BIT(certinfo);     /* gather lots of certificate info */
   BIT(earlydata);    /* use tls1.3 early data */
   BIT(enable_beast); /* allow this flaw for interoperability's sake */
@@ -317,14 +317,14 @@ struct ssl_general_config {
 #ifndef CURL_DISABLE_DIGEST_AUTH
 /* Struct used for Digest challenge-response authentication */
 struct digestdata {
+  char *origin_host;
+  int origin_port;
+  char *user;
+  char *passwd;
 #if defined(USE_WINDOWS_SSPI)
   BYTE *input_token;
   size_t input_token_len;
   CtxtHandle *http_context;
-  /* copy of user/passwd used to make the identity for http_context.
-     either may be NULL. */
-  char *user;
-  char *passwd;
 #else
   char *nonce;
   char *cnonce;
@@ -687,6 +687,8 @@ struct connectdata {
   char *options; /* options string, allocated */
   char *sasl_authzid;     /* authorization identity string, allocated */
   char *oauth_bearer; /* OAUTH2 bearer, allocated */
+  char *sasl_service; /* SASL service name for auth, allocated */
+  char *proxy_sasl_service; /* SASL service name for proxy auth, allocated */
   struct curltime created; /* creation time */
   struct curltime lastused; /* when returned to the connection poolas idle */
   curl_socket_t sock[2]; /* two sockets, the second is used for the data
@@ -945,15 +947,7 @@ struct Curl_data_prio_node {
  * on the same connection.
  */
 struct Curl_data_priority {
-#ifdef USE_NGHTTP2
-  /* tree like dependencies only implemented in nghttp2 */
-  struct Curl_easy *parent;
-  struct Curl_data_prio_node *children;
-#endif
   int weight;
-#ifdef USE_NGHTTP2
-  BIT(exclusive);
-#endif
 };
 
 /* Timers */
@@ -1042,6 +1036,7 @@ struct UrlState {
   void (*prev_signal)(int sig);
 #endif
 #ifndef CURL_DISABLE_DIGEST_AUTH
+  char *envproxy; /* last proxy string used for proxy-related state */
   struct digestdata digest;      /* state data for host Digest auth */
   struct digestdata proxydigest; /* state data for proxy Digest auth */
 #endif
